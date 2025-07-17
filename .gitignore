@@ -11,3 +11,4 @@ site
 # compiled python files
 *.pyc
 __pycache__/
+*.csv
