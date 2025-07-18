@@ -18,20 +18,17 @@ from scipy.interpolate import splprep, splev
 MIN_SPEED = 3.0
 MAX_SPEED = 6.0
 
-# 안정적인 PID 게인
-KP, KI, KD = 0.6, 0.1, 0.7
+# [핵심 수정] P 제어기 게인 대신 PID 게인 사용
+KP, KI, KD = 0.7, 0.2, 0.5   # 부드러운 제어를 위한 PID 게인
 
-# 조향 연동 감속 기능 파라미터
-STEERING_SPEED_DAMPING = 0.8    # 조향각이 속도에 미치는 영향력. 0.0 ~ 1.0
-
-# 경로 예측 및 조향 파라미터
-CURVATURE_LOOKAHEAD = 150
-CURVATURE_GAIN = 6.0
-LOOKAHEAD_DISTANCE = 3.0
-STEERING_GAIN = 0.9
+# Stanley 및 경로 파라미터
+K_CTE = 1.2
+K_SOFT = 1.0
+STEERING_GAIN = 1.0
+CURVATURE_GAIN = 5.0
 VEHICLE_LENGTH = 1.55
-MAX_STEER_ANGLE = 0.50
-LOCAL_PATH_WINDOW = 200
+MAX_STEER_ANGLE = 0.5
+LOCAL_PATH_WINDOW = 300
 INTERPOLATION_FACTOR = 20
 # ==============================================================================
 
@@ -48,11 +45,13 @@ class PIDController:
         self.prev_error = error
         return self.Kp * error + self.Ki * self.integral + self.Kd * derivative
 
-class PerformanceController:
+class StanleyPIDController:
     def __init__(self):
-        rospy.init_node("performance_controller")
+        rospy.init_node("stanley_pid_controller")
         
+        # PID 제어기 인스턴스 생성
         self.pid_controller = PIDController(KP, KI, KD)
+        
         self.path, self.path_curvatures = None, None
         self.current_pose, self.current_speed, self.is_path_generated = np.zeros(3), 0.0, False
         self.last_closest_idx = 0
@@ -67,17 +66,17 @@ class PerformanceController:
         rospy.Subscriber('/fsds/testing_only/track', Track, self.track_callback, queue_size=1)
         rospy.Subscriber('/fsds/testing_only/odom', Odometry, self.odom_callback, queue_size=1)
         
-        rospy.loginfo("Performance Controller (Final Tune) 노드 시작됨.")
+        rospy.loginfo("Stanley Controller with PID Speed Control 노드 시작됨.")
 
     def setup_plot(self):
-        self.ax.set_title("Pure Pursuit Controller")
+        self.ax.set_title("Stanley Controller (PID Speed)")
         self.ax.set_xlabel("X (m)"), self.ax.set_ylabel("Y (m)")
         self.path_plot, = self.ax.plot([], [], 'g--', label="Interpolated Path")
         self.blue_cone_plot, = self.ax.plot([], [], 'bo', markersize=4, label="Blue Cones")
         self.yellow_cone_plot, = self.ax.plot([], [], 'o', color='gold', markersize=4, label="Yellow Cones")
         self.history_plot, = self.ax.plot([], [], 'r-', label="Car Trajectory")
         self.car_plot, = self.ax.plot([], [], 'ko', markersize=6, label="Car")
-        self.lookahead_plot, = self.ax.plot([], [], 'mx', markersize=8, mew=2, label="Lookahead Point")
+        self.closest_point_plot, = self.ax.plot([], [], 'mx', markersize=8, mew=2, label="Closest Path Point")
         self.ax.grid(True), self.ax.legend(), self.ax.set_aspect('equal', adjustable='box')
 
     def track_callback(self, track_msg: Track):
@@ -117,6 +116,11 @@ class PerformanceController:
         ddx, ddy = np.gradient(dx), np.gradient(dy)
         self.path_curvatures = np.abs(dx * ddy - dy * ddx) / ((dx**2 + dy**2)**1.5 + 1e-6)
 
+    def normalize_angle(self, angle):
+        while angle > np.pi: angle -= 2.0 * np.pi
+        while angle < -np.pi: angle += 2.0 * np.pi
+        return angle
+
     def odom_callback(self, odom_msg: Odometry):
         if not self.is_path_generated: return
         linear_vel = odom_msg.twist.twist.linear
@@ -125,17 +129,17 @@ class PerformanceController:
         _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.current_pose = np.array([odom_msg.pose.pose.position.x, odom_msg.pose.pose.position.y, yaw])
         self.history_x.append(self.current_pose[0]), self.history_y.append(self.current_pose[1])
+        
         current_time = odom_msg.header.stamp.to_sec()
         dt = (current_time - self.last_time) if self.last_time else 0.02
         self.last_time = current_time
+        
         self.control_loop(dt)
 
     def control_loop(self, dt):
         front_axle_pos = self.current_pose[:2] + VEHICLE_LENGTH * np.array([math.cos(self.current_pose[2]), math.sin(self.current_pose[2])])
-        
         path_len = len(self.path)
-        search_start_idx = self.last_closest_idx
-        search_end_idx = (self.last_closest_idx + LOCAL_PATH_WINDOW) % path_len
+        search_start_idx, search_end_idx = self.last_closest_idx, (self.last_closest_idx + LOCAL_PATH_WINDOW) % path_len
         if search_start_idx < search_end_idx:
             local_path_indices = np.arange(search_start_idx, search_end_idx)
         else:
@@ -146,51 +150,46 @@ class PerformanceController:
         closest_idx = local_path_indices[local_closest_idx]
         self.last_closest_idx = closest_idx
 
-        target_idx = closest_idx
-        for i in range(len(local_path_indices)):
-            check_idx = local_path_indices[(local_closest_idx + i) % len(local_path_indices)]
-            dist_from_car = np.linalg.norm(self.path[check_idx] - front_axle_pos)
-            if dist_from_car >= LOOKAHEAD_DISTANCE:
-                target_idx = check_idx
-                break
-        if target_idx == closest_idx: target_idx = (closest_idx + 10) % path_len
-        target_point = self.path[target_idx]
-        alpha = math.atan2(target_point[1] - front_axle_pos[1], target_point[0] - front_axle_pos[0]) - self.current_pose[2]
-        delta = math.atan2(2.0 * VEHICLE_LENGTH * math.sin(alpha), LOOKAHEAD_DISTANCE)
-        steering_angle = np.clip(STEERING_GAIN * delta, -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
+        path_segment_start = self.path[closest_idx - 1] if closest_idx > 0 else self.path[closest_idx]
+        path_segment_end = self.path[closest_idx]
+        path_yaw = math.atan2(path_segment_end[1] - path_segment_start[1], path_segment_end[0] - path_segment_start[0])
+        heading_error = self.normalize_angle(path_yaw - self.current_pose[2])
         
-        # 지능형 목표 속도 로직에 조향 연동 감속 기능
-        future_indices = np.arange(closest_idx, closest_idx + CURVATURE_LOOKAHEAD) % len(self.path)
-        max_future_curvature = np.max(self.path_curvatures[future_indices])
-        target_speed_by_curve = MAX_SPEED - (MAX_SPEED - MIN_SPEED) * min(max_future_curvature * CURVATURE_GAIN, 1.0)
+        crosstrack_error = np.min(distances)
+        cross_prod = (path_segment_end[0] - path_segment_start[0]) * (front_axle_pos[1] - path_segment_start[1]) - \
+                     (path_segment_end[1] - path_segment_start[1]) * (front_axle_pos[0] - path_segment_start[0])
+        if cross_prod > 0:
+            crosstrack_error = -crosstrack_error
+
+        crosstrack_steer = math.atan(K_CTE * crosstrack_error / (K_SOFT + self.current_speed))
+        steering_angle = np.clip(STEERING_GAIN * (heading_error + crosstrack_steer), -MAX_STEER_ANGLE, MAX_STEER_ANGLE)
+
+        # PID 제어기를 사용
+        max_future_curvature = np.max(self.path_curvatures[np.arange(closest_idx, closest_idx + 150) % path_len])
+        target_speed = MAX_SPEED - (MAX_SPEED - MIN_SPEED) * min(max_future_curvature * CURVATURE_GAIN, 1.0)
         
-        # 조향각이 클수록 목표 속도를 추가로 낮춤
-        steering_damping_factor = 1.0 - STEERING_SPEED_DAMPING * abs(steering_angle / MAX_STEER_ANGLE)
-        final_target_speed = target_speed_by_curve * steering_damping_factor
-        
-        pid_output = self.pid_controller.calculate(final_target_speed, self.current_speed, dt)
+        pid_output = self.pid_controller.calculate(target_speed, self.current_speed, dt)
         
         if pid_output > 0:
-            # throttle 및 브레이크 제어
-            throttle, brake = np.clip(pid_output, 0.0, 0.4), 0.0
+            throttle, brake = np.clip(pid_output, 0.0, 0.8), 0.0
         else:
             throttle, brake = 0.0, np.clip(abs(pid_output), 0.0, 1.0)
         
         cmd_msg = ControlCommand(throttle=throttle, steering=-steering_angle, brake=brake)
         self.control_pub.publish(cmd_msg)
-        self.update_plot_data(target_point)
+        self.update_plot_data(self.path[closest_idx])
 
-    def update_plot_data(self, target_point):
+    def update_plot_data(self, closest_point):
         self.path_plot.set_data(self.path[:, 0], self.path[:, 1])
         self.blue_cone_plot.set_data(self.blue_cones_x, self.blue_cones_y)
         self.yellow_cone_plot.set_data(self.yellow_cones_x, self.yellow_cones_y)
         self.history_plot.set_data(self.history_x, self.history_y)
         self.car_plot.set_data([self.current_pose[0]], [self.current_pose[1]])
-        self.lookahead_plot.set_data([target_point[0]], [target_point[1]])
+        self.closest_point_plot.set_data([closest_point[0]], [closest_point[1]])
 
 if __name__ == '__main__':
     try:
-        controller = PerformanceController()
+        controller = StanleyPIDController()
         plt.show(block=False)
         while not rospy.is_shutdown():
             plt.pause(0.01)
