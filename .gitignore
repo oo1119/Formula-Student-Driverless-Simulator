@@ -12,3 +12,8 @@ site
 *.pyc
 __pycache__/
 *.csv
+*.jpg
+ros/src/fsds_agent/scripts/teleop_converter.py
+ros/src/fsds_agent/scripts/keyboard_translator.py
+ros/src/fsds_agent/scripts/autonomous_driver.py
+ros/src/fsds_agent/scripts/arrow_teleop.py
