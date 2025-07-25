@@ -27,8 +27,9 @@ STEERING_GAIN = 1.0         # 계산된 조향각에 대한 전체적인 민감�
 
 # --- 기타 파라미터 ---
 CURVATURE_GAIN = 5.0        # 경로 곡률에 따른 속도 감소 비율 (클수록 곡률이 큰 경로에서 속도를 더 줄임)
+STEERING_SPEED_DAMPING = 0.8# 조향각 계산 시 속도에 따른 감쇠 (0.0 ~ 1.0, 클수록 속도에 덜 민감)
 VEHICLE_LENGTH = 1.55       # 차량의 앞바퀴와 뒷바퀴 사이의 거리 (미터)
-MAX_STEER_ANGLE = 0.45      # 최대 조향각 (라디안), 차량이 회전할 수 있는 최대 각도
+MAX_STEER_ANGLE = 0.5      # 최대 조향각 (라디안), 차량이 회전할 수 있는 최대 각도
 LOCAL_PATH_WINDOW = 300     # 로컬 경로 윈도우 크기 (MPC가 참조할 경로의 길이)
 INTERPOLATION_FACTOR = 20   # 경로 보간 시 점의 개수 (더 부드러운 곡선을 위해)
 # ==============================================================================
@@ -183,12 +184,16 @@ class StanleyPIDController:
         
         # --- 속도 제어 (PID) ---
         
-        # 1. 동적 목표 속도 계산 (경로 곡률 기반)
-        max_future_curvature = np.max(self.path_curvatures[np.arange(closest_idx, closest_idx + 150) % path_len])
-        target_speed = MAX_SPEED - (MAX_SPEED - MIN_SPEED) * min(max_future_curvature * CURVATURE_GAIN, 1.0)
+        # 1. 경로 곡률 기반 목표 속도 계산
+        max_future_curvature = np.max(self.path_curvatures[np.arange(closest_idx, closest_idx + 150) % len(self.path)])
+        target_speed_by_curve = MAX_SPEED - (MAX_SPEED - MIN_SPEED) * min(max_future_curvature * CURVATURE_GAIN, 1.0)
         
-        # 2. PID 제어기로 스로틀/브레이크 값 계산
-        pid_output = self.pid_controller.calculate(target_speed, self.current_speed, dt)
+        # 2. 조향각 기반 속도 감속 추가
+        steering_damping_factor = 1.0 - STEERING_SPEED_DAMPING * abs(steering_angle / MAX_STEER_ANGLE)
+        final_target_speed = target_speed_by_curve * steering_damping_factor
+
+        # 3. PID 제어기로 스로틀/브레이크 값 계산 (목표 변수만 final_target_speed로 변경)
+        pid_output = self.pid_controller.calculate(final_target_speed, self.current_speed, dt)
         
         if pid_output > 0:
             throttle, brake = np.clip(pid_output, 0.0, 0.8), 0.0
