@@ -177,7 +177,7 @@ class FinalController:
 
         if len(path_waypoints) > 0: self.center_path_plot.set_data(path_waypoints[:, 0], path_waypoints[:, 1])
         else: self.center_path_plot.set_data([], [])
-        if goal_point is not None: self.goal_point_plot.set_data(goal_point[0], goal_point[1])
+        if goal_point is not None: self.goal_point_plot.set_data([goal_point[0]], [goal_point[1]])
         else: self.goal_point_plot.set_data([], [])
         self.speed_text.set_text(f'Target: {target_speed:.2f} m/s\nCurrent: {self.current_speed:.2f} m/s')
 
